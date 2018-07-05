@@ -6,14 +6,15 @@
 //!   establishes connections over TCP.
 //! - The [`Connect`](Connect) trait and related types to build custom connectors.
 use std::error::Error as StdError;
+use std::fmt;
 use std::mem;
 
 use bytes::{BufMut, BytesMut};
 use futures::Future;
-use http::{uri, Uri};
+use http::{uri, Response, Uri};
 use tokio_io::{AsyncRead, AsyncWrite};
 
-#[cfg(feature = "runtime")] pub use self::http::HttpConnector;
+#[cfg(feature = "runtime")] pub use self::http::{HttpConnector, HttpInfo};
 
 /// Connect to a destination, returning an IO transport.
 ///
@@ -46,7 +47,11 @@ pub struct Destination {
 pub struct Connected {
     //alpn: Alpn,
     pub(super) is_proxied: bool,
+    pub(super) extra: Option<Extra>,
 }
+
+pub(super) struct Extra(Box<ExtraInner>);
+
 
 /*TODO: when HTTP1 Upgrades to H2 are added, this will be needed
 #[derive(Debug)]
@@ -234,8 +239,8 @@ impl Connected {
     /// Create new `Connected` type with empty metadata.
     pub fn new() -> Connected {
         Connected {
-            //alpn: Alpn::Http1,
             is_proxied: false,
+            extra: None,
         }
     }
 
@@ -251,6 +256,12 @@ impl Connected {
         self
     }
 
+    /// Set extra connection information to be set in the extensions of every `Response`.
+    pub fn extra<T: Clone + Send + Sync + 'static>(mut self, extra: T) -> Connected {
+        self.extra = Some(Extra(Box::new(ExtraEnvelope(extra))));
+        self
+    }
+
     /*
     /// Set that the connected transport negotiated HTTP/2 as it's
     /// next protocol.
@@ -259,6 +270,61 @@ impl Connected {
         self
     }
     */
+
+    // Don't public expose that `Connected` is `Clone`, unsure if we want to
+    // keep that contract...
+    pub(super) fn clone(&self) -> Connected {
+        Connected {
+            is_proxied: self.is_proxied,
+            extra: self.extra.clone(),
+        }
+    }
+}
+
+// ===== impl Extra =====
+
+impl Extra {
+    pub(super) fn set(&self, res: &mut Response<::Body>) {
+        self.0.set(res);
+    }
+}
+
+impl Clone for Extra {
+    fn clone(&self) -> Extra {
+        Extra(self.0.clone_box())
+    }
+}
+
+impl fmt::Debug for Extra {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Extra")
+            .finish()
+    }
+}
+
+// This indirection allows the `Connected` to have a type-erased "extra" value,
+// while that type still knows its inner extra type. This allows the correct
+// TypeId to be used when inserting into `res.extensions_mut()`.
+#[derive(Clone)]
+struct ExtraEnvelope<T>(T);
+
+trait ExtraInner: Send + Sync {
+    fn clone_box(&self) -> Box<ExtraInner>;
+    fn set(&self, res: &mut Response<::Body>);
+}
+
+impl<T> ExtraInner for ExtraEnvelope<T>
+where
+    T: Clone + Send + Sync + 'static
+{
+    fn clone_box(&self) -> Box<ExtraInner> {
+        Box::new(self.clone())
+    }
+
+    fn set(&self, res: &mut Response<::Body>) {
+        let extra = self.0.clone();
+        res.extensions_mut().insert(extra);
+    }
 }
 
 #[cfg(test)]
@@ -436,14 +502,50 @@ mod http {
     /// A connector for the `http` scheme.
     ///
     /// Performs DNS resolution in a thread pool, and then connects over TCP.
+    ///
+    /// # Note
+    ///
+    /// Sets the [`HttpInfo`](HttpInfo) value on responses, which includes
+    /// transport information such as the remote socket address used.
     #[derive(Clone)]
     pub struct HttpConnector {
         executor: HttpConnectExecutor,
         enforce_http: bool,
         handle: Option<Handle>,
         keep_alive_timeout: Option<Duration>,
-        nodelay: bool,
         local_address: Option<IpAddr>,
+        nodelay: bool,
+    }
+
+    /// Extra information about the transport when an HttpConnector is used.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use hyper::client::{Client, connect::HttpInfo};
+    /// use hyper::rt::Future;
+    ///
+    /// let client = Client::new();
+    ///
+    /// let fut = client.get("http://example.local".parse().unwrap())
+    ///     .inspect(|resp| {
+    ///         let info = resp
+    ///             .extensions()
+    ///             .get::<HttpInfo>()
+    ///             .expect("HttpConnector sets HttpInfo");
+    ///
+    ///         println!("remote addr = {}", info.remote_addr());
+    ///     });
+    /// ```
+    ///
+    /// # Note
+    ///
+    /// If a different connector is used besides [`HttpConnector`](HttpConnector),
+    /// this value will not exist in the extensions. Consult that specific
+    /// connector to see what "extra" information it might provide to responses.
+    #[derive(Clone, Debug)]
+    pub struct HttpInfo {
+        remote_addr: SocketAddr,
     }
 
     impl HttpConnector {
@@ -600,6 +702,7 @@ mod http {
             }
         }
     }
+
     /// A Future representing work to connect to a URL.
     #[must_use = "futures do nothing unless polled"]
     pub struct HttpConnecting {
@@ -640,16 +743,12 @@ mod http {
                         }
                     },
                     State::Resolving(ref mut future, local_addr) => {
-                        match try!(future.poll()) {
-                            Async::NotReady => return Ok(Async::NotReady),
-                            Async::Ready(addrs) => {
-                                state = State::Connecting(ConnectingTcp {
-                                    addrs: addrs,
-                                    local_addr: local_addr,
-                                    current: None,
-                                })
-                            }
-                        };
+                        let addrs = try_ready!(future.poll());
+                        state = State::Connecting(ConnectingTcp {
+                            addrs: addrs,
+                            local_addr: local_addr,
+                            current: None,
+                        });
                     },
                     State::Connecting(ref mut c) => {
                         let sock = try_ready!(c.poll(&self.handle));
@@ -660,7 +759,13 @@ mod http {
 
                         sock.set_nodelay(self.nodelay)?;
 
-                        return Ok(Async::Ready((sock, Connected::new())));
+                        let extra = HttpInfo {
+                            remote_addr: sock.peer_addr()?,
+                        };
+                        let connected = Connected::new()
+                            .extra(extra);
+
+                        return Ok(Async::Ready((sock, connected)));
                     },
                     State::Error(ref mut e) => return Err(e.take().expect("polled more than once")),
                 }
@@ -707,6 +812,13 @@ mod http {
 
                 return Err(err.take().expect("missing connect error"));
             }
+        }
+    }
+
+    impl HttpInfo {
+        /// Get the remote address of the transport used.
+        pub fn remote_addr(&self) -> SocketAddr {
+            self.remote_addr
         }
     }
 

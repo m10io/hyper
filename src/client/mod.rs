@@ -92,7 +92,7 @@ use http::uri::Scheme;
 use body::{Body, Payload};
 use common::Exec;
 use common::lazy as hyper_lazy;
-use self::connect::{Connect, Destination};
+use self::connect::{Connect, Connected, Destination};
 use self::pool::{Pool, Poolable, Reservation};
 
 #[cfg(feature = "runtime")] pub use self::connect::HttpConnector;
@@ -304,7 +304,7 @@ where C: Connect + Sync + 'static,
                                 })
                                 .map(move |tx| {
                                     pool.pooled(connecting, PoolClient {
-                                        is_proxied: connected.is_proxied,
+                                        conn_info: connected,
                                         tx: match ver {
                                             Ver::Http1 => PoolTx::Http1(tx),
                                             Ver::Http2 => PoolTx::Http2(tx.into_http2()),
@@ -387,7 +387,7 @@ where C: Connect + Sync + 'static,
                 // CONNECT always sends origin-form, so check it first...
                 if req.method() == &Method::CONNECT {
                     authority_form(req.uri_mut());
-                } else if pooled.is_proxied {
+                } else if pooled.conn_info.is_proxied {
                     absolute_form(req.uri_mut());
                 } else {
                     origin_form(req.uri_mut());
@@ -400,6 +400,14 @@ where C: Connect + Sync + 'static,
             }
 
             let fut = pooled.send_request_retryable(req);
+
+            let extra_info = pooled.conn_info.extra.clone();
+            let fut = fut.map(move |mut res| {
+                if let Some(extra) = extra_info {
+                    extra.set(&mut res);
+                }
+                res
+            });
 
             // As of futures@0.1.21, there is a race condition in the mpsc
             // channel, such that sending when the receiver is closing can
@@ -584,7 +592,7 @@ where
 }
 
 struct PoolClient<B> {
-    is_proxied: bool,
+    conn_info: Connected,
     tx: PoolTx<B>,
 }
 
@@ -644,17 +652,17 @@ where
         match self.tx {
             PoolTx::Http1(tx) => {
                 Reservation::Unique(PoolClient {
-                    is_proxied: self.is_proxied,
+                    conn_info: self.conn_info,
                     tx: PoolTx::Http1(tx),
                 })
             },
             PoolTx::Http2(tx) => {
                 let b = PoolClient {
-                    is_proxied: self.is_proxied,
+                    conn_info: self.conn_info.clone(),
                     tx: PoolTx::Http2(tx.clone()),
                 };
                 let a = PoolClient {
-                    is_proxied: self.is_proxied,
+                    conn_info: self.conn_info,
                     tx: PoolTx::Http2(tx),
                 };
                 Reservation::Shared(a, b)
