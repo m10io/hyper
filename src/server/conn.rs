@@ -82,10 +82,14 @@ pub struct Connecting<I, F> {
     protocol: Http,
 }
 
+/// A future for serving connections on an executor
+///
+/// Polling this future will spawn new [`Serve`] connections on an executor
 #[must_use = "futures do nothing unless polled"]
 #[derive(Debug)]
-pub(super) struct SpawnAll<I, S> {
-    pub(super) serve: Serve<I, S>,
+pub struct SpawnAll<I, S> {
+    /// The Serve that SpawnAll will poll
+    pub serve: Serve<I, S>,
 }
 
 /// A future binding a connection with a Service.
@@ -537,7 +541,7 @@ where
 
 impl<I, S> Serve<I, S> {
     /// Spawn all incoming connections onto the executor in `Http`.
-    pub(super) fn spawn_all(self) -> SpawnAll<I, S> {
+    pub fn spawn_all(self) -> SpawnAll<I, S> {
         SpawnAll {
             serve: self,
         }
@@ -604,7 +608,6 @@ where
 }
 
 // ===== impl SpawnAll =====
-
 #[cfg(feature = "runtime")]
 impl<S> SpawnAll<AddrIncoming, S> {
     pub(super) fn local_addr(&self) -> SocketAddr {
@@ -630,7 +633,8 @@ where
     <S::Service as Service>::Future: Send + 'static,
     B: Payload,
 {
-    pub(super) fn poll_with<F1, F2, R>(&mut self, per_connection: F1) -> Poll<(), ::Error>
+    /// Polls this object with a per-connection callback.
+    pub fn poll_with<F1, F2, R>(&mut self, per_connection: F1) -> Poll<(), ::Error>
     where
         F1: Fn() -> F2,
         F2: FnOnce(UpgradeableConnection<I::Item, S::Service>) -> R + Send + 'static,
@@ -729,4 +733,3 @@ mod upgrades {
         }
     }
 }
-
